@@ -370,3 +370,251 @@
     (or (is-eq (get origin shipment) company-id) (is-eq (get destination shipment) company-id))
   )
 )
+
+
+
+(define-data-var max-batch-size uint u10)
+
+(define-public (create-batch-shipments 
+    (destination-ids (list 10 uint))
+    (products (list 10 (string-ascii 100)))
+    (quantities (list 10 uint)))
+    (let
+        ((company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+         (origin-id (get company-id company-data)))
+        (asserts! (<= (len destination-ids) (var-get max-batch-size)) (err u108))
+        (asserts! (is-eq (len destination-ids) (len products)) (err u109))
+        (asserts! (is-eq (len products) (len quantities)) (err u109))
+        (ok (map create-single-batch-shipment destination-ids products quantities))
+    )
+)
+
+(define-private (create-single-batch-shipment 
+    (destination-id uint)
+    (product (string-ascii 100))
+    (quantity uint))
+    (create-shipment destination-id product quantity)
+)
+
+
+
+(define-public (get-company-subscription-status (company-id uint))
+  (let
+    (
+      (company (unwrap! (map-get? companies { company-id: company-id }) err-not-found))
+    )
+    (ok {
+      subscription-active: (get subscription-active company),
+      subscription-expiry: (get subscription-expiry company)
+    })
+  )
+)
+
+
+(define-map shipment-ratings
+    { shipment-id: uint }
+    {
+        rating: uint,
+        feedback: (string-ascii 500),
+        rated-by: principal
+    }
+)
+
+(define-public (rate-shipment 
+    (shipment-id uint)
+    (rating uint)
+    (feedback (string-ascii 500)))
+    (let
+        ((shipment (unwrap! (get-shipment shipment-id) err-not-found))
+         (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found)))
+        (asserts! (<= rating u5) (err u110))
+        (asserts! (is-eq (get destination shipment) (get company-id company-data)) err-not-authorized)
+        (asserts! (is-eq (get status shipment) "delivered") err-invalid-status)
+        (ok (map-set shipment-ratings
+            { shipment-id: shipment-id }
+            {
+                rating: rating,
+                feedback: feedback,
+                rated-by: tx-sender
+            }
+        ))
+    )
+)
+
+
+(define-map shipment-priorities
+    { shipment-id: uint }
+    { 
+        priority-level: (string-ascii 20),
+        extra-fee: uint
+    }
+)
+
+(define-public (set-shipment-priority
+    (shipment-id uint)
+    (priority-level (string-ascii 20)))
+    (let
+        ((shipment (unwrap! (get-shipment shipment-id) err-not-found))
+         (fee (get-priority-fee priority-level)))
+        (asserts! (or (is-eq priority-level "standard")
+                     (is-eq priority-level "express")
+                     (is-eq priority-level "urgent")) (err u111))
+        (unwrap! (stx-transfer? fee tx-sender (as-contract tx-sender)) err-payment-failed)
+        (ok (map-set shipment-priorities
+            { shipment-id: shipment-id }
+            {
+                priority-level: priority-level,
+                extra-fee: fee
+            }
+        ))
+    )
+)
+
+(define-private (get-priority-fee (priority-level (string-ascii 20)))
+    (if (is-eq priority-level "express")
+        u50
+        (if (is-eq priority-level "urgent")
+            u100
+            u0)
+    )
+)
+
+
+(define-map shipment-insurance
+    { shipment-id: uint }
+    {
+        coverage-amount: uint,
+        premium-paid: uint,
+        insured-by: principal
+    }
+)
+
+(define-public (insure-shipment 
+    (shipment-id uint)
+    (coverage-amount uint))
+    (let
+        ((premium (calculate-premium coverage-amount))
+         (shipment (unwrap! (get-shipment shipment-id) err-not-found)))
+        (asserts! (is-eq (get status shipment) "created") err-invalid-status)
+        (unwrap! (stx-transfer? premium tx-sender (as-contract tx-sender)) err-payment-failed)
+        (ok (map-set shipment-insurance
+            { shipment-id: shipment-id }
+            {
+                coverage-amount: coverage-amount,
+                premium-paid: premium,
+                insured-by: tx-sender
+            }
+        ))
+    )
+)
+
+(define-private (calculate-premium (coverage-amount uint))
+    (/ (* coverage-amount u3) u100)
+)
+
+(define-map shipment-documents
+    { shipment-id: uint, document-type: (string-ascii 20) }
+    {
+        hash: (buff 32),
+        uploaded-by: principal,
+        timestamp: uint
+    }
+)
+
+(define-public (add-shipment-document 
+    (shipment-id uint)
+    (document-type (string-ascii 20))
+    (document-hash (buff 32)))
+    (let
+        ((company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+         (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1)))))
+        (asserts! (is-authorized-for-shipment shipment-id (get company-id company-data)) err-not-authorized)
+        (ok (map-set shipment-documents
+            { shipment-id: shipment-id, document-type: document-type }
+            {
+                hash: document-hash,
+                uploaded-by: tx-sender,
+                timestamp: current-time
+            }
+        ))
+    )
+)
+
+
+(define-map shipment-routes
+    { shipment-id: uint }
+    {
+        stops: (list 5 uint),
+        current-stop: uint,
+        route-complete: bool
+    }
+)
+
+(define-public (create-route
+    (shipment-id uint)
+    (stop-locations (list 5 uint)))
+    (let
+        ((shipment (unwrap! (get-shipment shipment-id) err-not-found))
+         (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found)))
+        (asserts! (is-eq (get origin shipment) (get company-id company-data)) err-not-authorized)
+        (asserts! (> (len stop-locations) u0) (err u112))
+        (ok (map-set shipment-routes
+            { shipment-id: shipment-id }
+            {
+                stops: stop-locations,
+                current-stop: u0,
+                route-complete: false
+            }
+        ))
+    )
+)
+
+(define-public (update-route-progress
+    (shipment-id uint))
+    (let
+        ((route (unwrap! (map-get? shipment-routes { shipment-id: shipment-id }) err-not-found))
+         (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+         (next-stop (+ (get current-stop route) u1)))
+        (asserts! (is-authorized-for-shipment shipment-id (get company-id company-data)) err-not-authorized)
+        (asserts! (< next-stop (len (get stops route))) (err u113))
+        (ok (map-set shipment-routes
+            { shipment-id: shipment-id }
+            (merge route {
+                current-stop: next-stop,
+                route-complete: (is-eq next-stop (- (len (get stops route)) u1))
+            })
+        ))
+    )
+)
+
+(define-map shipment-disputes
+    { shipment-id: uint }
+    {
+        reason: (string-ascii 500),
+        filed-by: principal,
+        status: (string-ascii 20),
+        resolution: (optional (string-ascii 500)),
+        timestamp: uint
+    }
+)
+
+(define-public (file-dispute
+    (shipment-id uint)
+    (reason (string-ascii 500)))
+    (let
+        ((company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+         (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1)))))
+        (asserts! (is-authorized-for-shipment shipment-id (get company-id company-data)) err-not-authorized)
+        (ok (map-set shipment-disputes
+            { shipment-id: shipment-id }
+            {
+                reason: reason,
+                filed-by: tx-sender,
+                status: "pending",
+                resolution: none,
+                timestamp: current-time
+            }
+        ))
+    )
+)
+
