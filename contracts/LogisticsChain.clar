@@ -618,3 +618,300 @@
     )
 )
 
+
+
+;; Analytics data structures
+(define-map company-analytics
+  { company-id: uint }
+  {
+    total-shipments: uint,
+    completed-shipments: uint,
+    rejected-shipments: uint,
+    total-quality-score: uint,
+    avg-delivery-time: uint
+  }
+)
+
+(define-map global-analytics
+  { key: (string-ascii 20) }
+  {
+    total-shipments: uint,
+    completed-shipments: uint,
+    rejected-shipments: uint,
+    avg-quality-score: uint
+  }
+)
+
+;; Initialize global analytics
+(map-set global-analytics
+  { key: "stats" }
+  {
+    total-shipments: u0,
+    completed-shipments: u0,
+    rejected-shipments: u0,
+    avg-quality-score: u0
+  }
+)
+
+;; Update analytics when shipment is created
+(define-private (update-analytics-shipment-created (origin-id uint) (destination-id uint))
+  (let
+    (
+      (origin-analytics (default-to 
+        { total-shipments: u0, completed-shipments: u0, rejected-shipments: u0, total-quality-score: u0, avg-delivery-time: u0 } 
+        (map-get? company-analytics { company-id: origin-id })))
+      (destination-analytics (default-to 
+        { total-shipments: u0, completed-shipments: u0, rejected-shipments: u0, total-quality-score: u0, avg-delivery-time: u0 } 
+        (map-get? company-analytics { company-id: destination-id })))
+      (global-stats (default-to 
+        { total-shipments: u0, completed-shipments: u0, rejected-shipments: u0, avg-quality-score: u0 } 
+        (map-get? global-analytics { key: "stats" })))
+    )
+    
+    ;; Update origin company analytics
+    (map-set company-analytics
+      { company-id: origin-id }
+      (merge origin-analytics {
+        total-shipments: (+ (get total-shipments origin-analytics) u1)
+      })
+    )
+    
+    ;; Update destination company analytics
+    (map-set company-analytics
+      { company-id: destination-id }
+      (merge destination-analytics {
+        total-shipments: (+ (get total-shipments destination-analytics) u1)
+      })
+    )
+    
+    ;; Update global analytics
+    (map-set global-analytics
+      { key: "stats" }
+      (merge global-stats {
+        total-shipments: (+ (get total-shipments global-stats) u1)
+      })
+    )
+  )
+)
+
+;; Update analytics when shipment status changes
+(define-private (update-analytics-status-change (shipment-id uint) (new-status (string-ascii 20)))
+  (let
+    (
+      (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) (ok false)))
+      (origin-id (get origin shipment))
+      (destination-id (get destination shipment))
+      (quality-score (default-to u0 (get quality-score shipment)))
+      (origin-analytics (default-to 
+        { total-shipments: u0, completed-shipments: u0, rejected-shipments: u0, total-quality-score: u0, avg-delivery-time: u0 } 
+        (map-get? company-analytics { company-id: origin-id })))
+      (destination-analytics (default-to 
+        { total-shipments: u0, completed-shipments: u0, rejected-shipments: u0, total-quality-score: u0, avg-delivery-time: u0 } 
+        (map-get? company-analytics { company-id: destination-id })))
+      (global-stats (default-to 
+        { total-shipments: u0, completed-shipments: u0, rejected-shipments: u0, avg-quality-score: u0 } 
+        (map-get? global-analytics { key: "stats" })))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (delivery-time (if (is-eq new-status "delivered") 
+                        (- current-time (get created-at shipment))
+                        u0))
+    )
+    
+    (if (is-eq new-status "delivered")
+      (begin
+        ;; Update origin company analytics
+        (map-set company-analytics
+          { company-id: origin-id }
+          (merge origin-analytics {
+            completed-shipments: (+ (get completed-shipments origin-analytics) u1),
+            total-quality-score: (+ (get total-quality-score origin-analytics) quality-score),
+            avg-delivery-time: (if (is-eq (get completed-shipments origin-analytics) u0)
+                                 delivery-time
+                                 (/ (+ (* (get avg-delivery-time origin-analytics) (get completed-shipments origin-analytics)) delivery-time)
+                                    (+ (get completed-shipments origin-analytics) u1)))
+          })
+        )
+        
+        ;; Update destination company analytics
+        (map-set company-analytics
+          { company-id: destination-id }
+          (merge destination-analytics {
+            completed-shipments: (+ (get completed-shipments destination-analytics) u1),
+            total-quality-score: (+ (get total-quality-score destination-analytics) quality-score),
+            avg-delivery-time: (if (is-eq (get completed-shipments destination-analytics) u0)
+                                 delivery-time
+                                 (/ (+ (* (get avg-delivery-time destination-analytics) (get completed-shipments destination-analytics)) delivery-time)
+                                    (+ (get completed-shipments destination-analytics) u1)))
+          })
+        )
+        
+        ;; Update global analytics
+        (map-set global-analytics
+          { key: "stats" }
+          (merge global-stats {
+            completed-shipments: (+ (get completed-shipments global-stats) u1),
+            avg-quality-score: (if (is-eq (get completed-shipments global-stats) u0)
+                                quality-score
+                                (/ (+ (* (get avg-quality-score global-stats) (get completed-shipments global-stats)) quality-score)
+                                   (+ (get completed-shipments global-stats) u1)))
+          })
+        )
+        (ok true)
+      )
+      (if (is-eq new-status "rejected")
+        (begin
+          ;; Update origin company analytics
+          (map-set company-analytics
+            { company-id: origin-id }
+            (merge origin-analytics {
+              rejected-shipments: (+ (get rejected-shipments origin-analytics) u1)
+            })
+          )
+          
+          ;; Update destination company analytics
+          (map-set company-analytics
+            { company-id: destination-id }
+            (merge destination-analytics {
+              rejected-shipments: (+ (get rejected-shipments destination-analytics) u1)
+            })
+          )
+          
+          ;; Update global analytics
+          (map-set global-analytics
+            { key: "stats" }
+            (merge global-stats {
+              rejected-shipments: (+ (get rejected-shipments global-stats) u1)
+            })
+          )
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+;; Modified create-shipment function to update analytics
+(define-public (create-shipment-new (destination-id uint) (product (string-ascii 100)) (quantity uint))
+  (let
+    (
+      (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+      (origin-id (get company-id company-data))
+      (shipment-id (var-get next-shipment-id))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    
+    ;; Check if company has active subscription
+    (asserts! (is-subscription-active origin-id) err-not-subscriber)
+    (asserts! (is-subscription-active destination-id) err-not-subscriber)
+    
+    (map-set shipments
+      { shipment-id: shipment-id }
+      {
+        origin: origin-id,
+        destination: destination-id,
+        product: product,
+        quantity: quantity,
+        created-at: current-time,
+        status: "created",
+        quality-score: none,
+        last-updated: current-time,
+        settlement-complete: false
+      }
+    )
+    
+    (var-set next-shipment-id (+ shipment-id u1))
+    
+    ;; Update analytics
+    (update-analytics-shipment-created origin-id destination-id)
+    
+    (ok shipment-id)
+  )
+)
+
+
+;; Read-only functions for analytics
+(define-read-only (get-company-analytics (company-id uint))
+  (map-get? company-analytics { company-id: company-id })
+)
+
+(define-read-only (get-global-analytics)
+  (map-get? global-analytics { key: "stats" })
+)
+
+(define-read-only (get-company-performance-metrics (company-id uint))
+  (let
+    (
+      (analytics (default-to 
+        { total-shipments: u0, completed-shipments: u0, rejected-shipments: u0, total-quality-score: u0, avg-delivery-time: u0 } 
+        (map-get? company-analytics { company-id: company-id })))
+    )
+    {
+      on-time-delivery-rate: (if (is-eq (get total-shipments analytics) u0)
+                               u0
+                               (/ (* (get completed-shipments analytics) u100) (get total-shipments analytics))),
+      avg-quality-score: (if (is-eq (get completed-shipments analytics) u0)
+                           u0
+                           (/ (get total-quality-score analytics) (get completed-shipments analytics))),
+      avg-delivery-time: (get avg-delivery-time analytics)
+    }
+  )
+)
+
+
+;; Escrow system data structures
+(define-map escrow-accounts
+  { shipment-id: uint }
+  {
+    amount: uint,
+    sender: principal,
+    receiver: principal,
+    release-threshold: uint,
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-constant err-escrow-exists (err u120))
+(define-constant err-escrow-not-found (err u121))
+(define-constant err-insufficient-funds (err u122))
+(define-constant err-unauthorized-escrow (err u123))
+(define-constant err-invalid-escrow-status (err u124))
+(define-constant err-quality-below-threshold (err u125))
+
+;; Create an escrow for a shipment
+(define-public (create-escrow (shipment-id uint) (amount uint) (release-threshold uint))
+  (let
+    (
+      (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) err-not-found))
+      (origin-company (unwrap! (map-get? companies { company-id: (get origin shipment) }) err-not-found))
+      (destination-company (unwrap! (map-get? companies { company-id: (get destination shipment) }) err-not-found))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    
+    ;; Check if escrow already exists
+    (asserts! (is-none (map-get? escrow-accounts { shipment-id: shipment-id })) err-escrow-exists)
+    
+    ;; Check if sender is the destination company owner (buyer)
+    (asserts! (is-eq tx-sender (get owner destination-company)) err-not-authorized)
+    
+    ;; Transfer funds to contract
+    (unwrap! (stx-transfer? amount tx-sender (as-contract tx-sender)) err-insufficient-funds)
+    
+    ;; Create escrow account
+    (map-set escrow-accounts
+      { shipment-id: shipment-id }
+      {
+        amount: amount,
+        sender: tx-sender,
+        receiver: (get owner origin-company),
+        release-threshold: release-threshold,
+        status: "locked",
+        created-at: current-time
+      }
+    )
+    
+    (ok true)
+  )
+)
+
