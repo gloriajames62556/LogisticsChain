@@ -29,6 +29,45 @@
 (define-data-var next-company-id uint u1)
 (define-data-var subscription-fee uint u100) ;; in STX
 
+(define-constant err-multisig-exists (err u130))
+(define-constant err-multisig-not-found (err u131))
+(define-constant err-insufficient-approvals (err u132))
+(define-constant err-already-approved (err u133))
+(define-constant err-not-authorized-approver (err u134))
+(define-constant err-multisig-required (err u135))
+
+(define-map multisig-configs
+  { shipment-id: uint }
+  {
+    required-approvals: uint,
+    authorized-approvers: (list 5 principal),
+    current-approvals: uint,
+    approvers: (list 5 principal),
+    operation-type: (string-ascii 30),
+    operation-data: (string-ascii 100),
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-map multisig-approvals
+  { shipment-id: uint, approver: principal }
+  {
+    approved: bool,
+    timestamp: uint,
+    signature-hash: (buff 32)
+  }
+)
+
+(define-map shipment-multisig-requirements
+  { shipment-id: uint }
+  {
+    requires-multisig: bool,
+    min-approvals: uint,
+    authorized-parties: (list 5 principal)
+  }
+)
+
 ;; data maps
 (define-map companies
   { company-id: uint }
@@ -915,3 +954,232 @@
   )
 )
 
+
+
+(define-public (setup-multisig-shipment 
+    (shipment-id uint) 
+    (min-approvals uint) 
+    (authorized-parties (list 5 principal)))
+  (let
+    (
+      (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) err-not-found))
+      (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+      (company-id (get company-id company-data))
+    )
+    
+    (asserts! (is-eq (get origin shipment) company-id) err-not-authorized)
+    (asserts! (> min-approvals u0) (err u136))
+    (asserts! (<= min-approvals (len authorized-parties)) (err u137))
+    (asserts! (is-none (map-get? shipment-multisig-requirements { shipment-id: shipment-id })) err-multisig-exists)
+    
+    (map-set shipment-multisig-requirements
+      { shipment-id: shipment-id }
+      {
+        requires-multisig: true,
+        min-approvals: min-approvals,
+        authorized-parties: authorized-parties
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-multisig-operation 
+    (shipment-id uint) 
+    (operation-type (string-ascii 30)) 
+    (operation-data (string-ascii 100)))
+  (let
+    (
+      (multisig-req (unwrap! (map-get? shipment-multisig-requirements { shipment-id: shipment-id }) err-multisig-not-found))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    
+    (asserts! (get requires-multisig multisig-req) err-multisig-required)
+    (asserts! (is-authorized-multisig-user shipment-id tx-sender) err-not-authorized-approver)
+    (asserts! (is-none (map-get? multisig-configs { shipment-id: shipment-id })) err-multisig-exists)
+    
+    (map-set multisig-configs
+      { shipment-id: shipment-id }
+      {
+        required-approvals: (get min-approvals multisig-req),
+        authorized-approvers: (get authorized-parties multisig-req),
+        current-approvals: u0,
+        approvers: (list),
+        operation-type: operation-type,
+        operation-data: operation-data,
+        status: "pending",
+        created-at: current-time
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (approve-multisig-operation 
+    (shipment-id uint) 
+    (signature-hash (buff 32)))
+  (let
+    (
+      (multisig-config (unwrap! (map-get? multisig-configs { shipment-id: shipment-id }) err-multisig-not-found))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (existing-approval (map-get? multisig-approvals { shipment-id: shipment-id, approver: tx-sender }))
+    )
+    
+    (asserts! (is-authorized-multisig-user shipment-id tx-sender) err-not-authorized-approver)
+    (asserts! (is-eq (get status multisig-config) "pending") err-invalid-escrow-status)
+    (asserts! (is-none existing-approval) err-already-approved)
+    
+    (map-set multisig-approvals
+      { shipment-id: shipment-id, approver: tx-sender }
+      {
+        approved: true,
+        timestamp: current-time,
+        signature-hash: signature-hash
+      }
+    )
+    
+    (let
+      (
+        (new-approval-count (+ (get current-approvals multisig-config) u1))
+        (updated-approvers (unwrap! (as-max-len? (append (get approvers multisig-config) tx-sender) u5) (err u138)))
+      )
+      
+      (map-set multisig-configs
+        { shipment-id: shipment-id }
+        (merge multisig-config {
+          current-approvals: new-approval-count,
+          approvers: updated-approvers,
+          status: (if (>= new-approval-count (get required-approvals multisig-config)) "approved" "pending")
+        })
+      )
+    )
+    (ok true)
+  )
+)
+
+
+
+(define-public (multisig-update-shipment-status 
+    (shipment-id uint) 
+    (new-status (string-ascii 20)))
+  (let
+    (
+      (multisig-req (map-get? shipment-multisig-requirements { shipment-id: shipment-id }))
+    )
+    
+    (if (is-some multisig-req)
+        (begin
+          (unwrap! (create-multisig-operation shipment-id "status-change" new-status) err-multisig-not-found)
+          (ok true)
+        )
+        (update-shipment-status shipment-id new-status))
+  )
+)
+
+(define-public (multisig-settle-shipment (shipment-id uint))
+  (let
+    (
+      (multisig-req (map-get? shipment-multisig-requirements { shipment-id: shipment-id }))
+    )
+    
+    (if (is-some multisig-req)
+        (begin
+          (unwrap! (create-multisig-operation shipment-id "settlement" "settle") err-multisig-not-found)
+          (ok true)
+        )
+        (settle-shipment shipment-id))
+  )
+)
+
+(define-public (revoke-multisig-approval (shipment-id uint))
+  (let
+    (
+      (multisig-config (unwrap! (map-get? multisig-configs { shipment-id: shipment-id }) err-multisig-not-found))
+      (existing-approval (unwrap! (map-get? multisig-approvals { shipment-id: shipment-id, approver: tx-sender }) err-not-found))
+    )
+    
+    (asserts! (is-eq (get status multisig-config) "pending") err-invalid-escrow-status)
+    (asserts! (get approved existing-approval) err-not-found)
+    
+    (map-delete multisig-approvals { shipment-id: shipment-id, approver: tx-sender })
+    
+    (let
+      (
+        (new-approval-count (- (get current-approvals multisig-config) u1))
+        (filtered-approvers (filter-approver (get approvers multisig-config) tx-sender))
+      )
+      
+      (map-set multisig-configs
+        { shipment-id: shipment-id }
+        (merge multisig-config {
+          current-approvals: new-approval-count,
+          approvers: filtered-approvers,
+          status: "pending"
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-multisig-config (shipment-id uint))
+  (map-get? multisig-configs { shipment-id: shipment-id })
+)
+
+(define-read-only (get-multisig-requirements (shipment-id uint))
+  (map-get? shipment-multisig-requirements { shipment-id: shipment-id })
+)
+
+(define-read-only (get-multisig-approval (shipment-id uint) (approver principal))
+  (map-get? multisig-approvals { shipment-id: shipment-id, approver: approver })
+)
+
+(define-read-only (is-multisig-ready (shipment-id uint))
+  (let
+    (
+      (multisig-config (map-get? multisig-configs { shipment-id: shipment-id }))
+    )
+    
+    (match multisig-config
+      config (>= (get current-approvals config) (get required-approvals config))
+      false)
+  )
+)
+
+(define-read-only (get-multisig-status (shipment-id uint))
+  (let
+    (
+      (multisig-config (map-get? multisig-configs { shipment-id: shipment-id }))
+      (multisig-req (map-get? shipment-multisig-requirements { shipment-id: shipment-id }))
+    )
+    
+    {
+      has-multisig: (is-some multisig-req),
+      pending-operation: (is-some multisig-config),
+      ready-to-execute: (is-multisig-ready shipment-id),
+      current-approvals: (match multisig-config config (get current-approvals config) u0),
+      required-approvals: (match multisig-req req (get min-approvals req) u0)
+    }
+  )
+)
+
+(define-private (is-authorized-multisig-user (shipment-id uint) (user principal))
+  (let
+    (
+      (multisig-req (unwrap! (map-get? shipment-multisig-requirements { shipment-id: shipment-id }) false))
+    )
+    
+    (is-some (index-of (get authorized-parties multisig-req) user))
+  )
+)
+
+(define-private (filter-approver (approvers (list 5 principal)) (to-remove principal))
+  (filter is-not-target-approver approvers)
+)
+
+(define-private (is-not-target-approver (approver principal))
+  (not (is-eq approver tx-sender))
+)
