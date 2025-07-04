@@ -35,6 +35,11 @@
 (define-constant err-already-approved (err u133))
 (define-constant err-not-authorized-approver (err u134))
 (define-constant err-multisig-required (err u135))
+(define-constant err-sla-exists (err u140))
+(define-constant err-sla-not-found (err u141))
+(define-constant err-sla-already-evaluated (err u142))
+(define-constant err-invalid-sla-terms (err u143))
+(define-constant err-sla-evaluation-too-early (err u144))
 
 (define-map multisig-configs
   { shipment-id: uint }
@@ -1182,4 +1187,179 @@
 
 (define-private (is-not-target-approver (approver principal))
   (not (is-eq approver tx-sender))
+)
+
+(define-map sla-contracts
+  { shipment-id: uint }
+  {
+    delivery-deadline: uint,
+    quality-threshold: uint,
+    penalty-amount: uint,
+    reward-amount: uint,
+    created-by: principal,
+    status: (string-ascii 20),
+    evaluated: bool,
+    evaluation-result: (optional (string-ascii 20)),
+    created-at: uint
+  }
+)
+
+(define-public (create-sla (shipment-id uint) (delivery-deadline uint) (quality-threshold uint) (penalty-amount uint) (reward-amount uint))
+  (let
+    (
+      (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) err-not-found))
+      (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+      (company-id (get company-id company-data))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    
+    (asserts! (is-eq (get origin shipment) company-id) err-not-authorized)
+    (asserts! (is-none (map-get? sla-contracts { shipment-id: shipment-id })) err-sla-exists)
+    (asserts! (> delivery-deadline current-time) err-invalid-sla-terms)
+    (asserts! (> quality-threshold u0) err-invalid-sla-terms)
+    (asserts! (<= quality-threshold u100) err-invalid-sla-terms)
+    (asserts! (> penalty-amount u0) err-invalid-sla-terms)
+    (asserts! (> reward-amount u0) err-invalid-sla-terms)
+    
+    (unwrap! (stx-transfer? (+ penalty-amount reward-amount) tx-sender (as-contract tx-sender)) err-payment-failed)
+    
+    (map-set sla-contracts
+      { shipment-id: shipment-id }
+      {
+        delivery-deadline: delivery-deadline,
+        quality-threshold: quality-threshold,
+        penalty-amount: penalty-amount,
+        reward-amount: reward-amount,
+        created-by: tx-sender,
+        status: "active",
+        evaluated: false,
+        evaluation-result: none,
+        created-at: current-time
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (evaluate-sla (shipment-id uint))
+  (let
+    (
+      (sla (unwrap! (map-get? sla-contracts { shipment-id: shipment-id }) err-sla-not-found))
+      (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) err-not-found))
+      (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+      (company-id (get company-id company-data))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (destination-company (unwrap! (map-get? companies { company-id: (get destination shipment) }) err-not-found))
+      (quality-score (default-to u0 (get quality-score shipment)))
+      (is-delivered (is-eq (get status shipment) "delivered"))
+      (is-rejected (is-eq (get status shipment) "rejected"))
+      (is-on-time (and is-delivered (<= (get last-updated shipment) (get delivery-deadline sla))))
+      (meets-quality (>= quality-score (get quality-threshold sla)))
+      (exceeds-quality (>= quality-score (+ (get quality-threshold sla) u20)))
+    )
+    
+    (asserts! (is-eq (get destination shipment) company-id) err-not-authorized)
+    (asserts! (not (get evaluated sla)) err-sla-already-evaluated)
+    (asserts! (or is-delivered is-rejected) err-sla-evaluation-too-early)
+    
+    (if (and is-delivered is-on-time meets-quality)
+      (begin
+        (if exceeds-quality
+          (begin
+            (unwrap! (as-contract (stx-transfer? (get reward-amount sla) tx-sender (get owner destination-company))) err-payment-failed)
+            (map-set sla-contracts
+              { shipment-id: shipment-id }
+              (merge sla {
+                evaluated: true,
+                evaluation-result: (some "reward-paid"),
+                status: "completed"
+              })
+            )
+            (ok "reward-paid")
+          )
+          (begin
+            (map-set sla-contracts
+              { shipment-id: shipment-id }
+              (merge sla {
+                evaluated: true,
+                evaluation-result: (some "terms-met"),
+                status: "completed"
+              })
+            )
+            (ok "terms-met")
+          )
+        )
+      )
+      (begin
+        (unwrap! (as-contract (stx-transfer? (get penalty-amount sla) tx-sender (get owner destination-company))) err-payment-failed)
+        (map-set sla-contracts
+          { shipment-id: shipment-id }
+          (merge sla {
+            evaluated: true,
+            evaluation-result: (some "penalty-paid"),
+            status: "breached"
+          })
+        )
+        (ok "penalty-paid")
+      )
+    )
+  )
+)
+
+(define-public (cancel-sla (shipment-id uint))
+  (let
+    (
+      (sla (unwrap! (map-get? sla-contracts { shipment-id: shipment-id }) err-sla-not-found))
+      (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) err-not-found))
+      (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+      (company-id (get company-id company-data))
+    )
+    
+    (asserts! (is-eq (get created-by sla) tx-sender) err-not-authorized)
+    (asserts! (not (get evaluated sla)) err-sla-already-evaluated)
+    (asserts! (is-eq (get status shipment) "created") err-invalid-status)
+    
+    (unwrap! (as-contract (stx-transfer? (+ (get penalty-amount sla) (get reward-amount sla)) tx-sender (get created-by sla))) err-payment-failed)
+    
+    (map-set sla-contracts
+      { shipment-id: shipment-id }
+      (merge sla {
+        evaluated: true,
+        evaluation-result: (some "cancelled"),
+        status: "cancelled"
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-sla-contract (shipment-id uint))
+  (map-get? sla-contracts { shipment-id: shipment-id })
+)
+
+(define-read-only (check-sla-compliance (shipment-id uint))
+  (let
+    (
+      (sla (unwrap! (map-get? sla-contracts { shipment-id: shipment-id }) (ok { compliant: false, reason: "sla-not-found" })))
+      (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) (ok { compliant: false, reason: "shipment-not-found" })))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (quality-score (default-to u0 (get quality-score shipment)))
+      (is-delivered (is-eq (get status shipment) "delivered"))
+      (is-on-time (and is-delivered (<= (get last-updated shipment) (get delivery-deadline sla))))
+      (meets-quality (>= quality-score (get quality-threshold sla)))
+    )
+    
+    (ok {
+      compliant: (and is-delivered is-on-time meets-quality),
+      reason: (if (and is-delivered is-on-time meets-quality)
+                "compliant"
+                (if (not is-delivered)
+                  "not-delivered"
+                  (if (not is-on-time)
+                    "late-delivery"
+                    "quality-below-threshold")))
+    })
+  )
 )
