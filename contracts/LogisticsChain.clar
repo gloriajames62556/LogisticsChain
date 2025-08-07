@@ -41,6 +41,13 @@
 (define-constant err-invalid-sla-terms (err u143))
 (define-constant err-sla-evaluation-too-early (err u144))
 
+;; Dynamic Pricing Engine constants
+(define-constant err-invalid-pricing-params (err u150))
+(define-constant err-route-not-found (err u151))
+(define-constant err-pricing-config-exists (err u152))
+(define-constant err-insufficient-historical-data (err u153))
+(define-constant err-invalid-cargo-type (err u154))
+
 (define-map multisig-configs
   { shipment-id: uint }
   {
@@ -1363,3 +1370,336 @@
     })
   )
 )
+
+;; ===== DYNAMIC PRICING ENGINE =====
+;; Automated pricing system based on market factors and route analytics
+
+;; Data variables for pricing configuration
+(define-data-var base-rate-per-km uint u5) ;; STX per kilometer
+(define-data-var demand-multiplier-max uint u200) ;; max 200% of base rate
+(define-data-var distance-discount-threshold uint u500) ;; km threshold for bulk discount
+(define-data-var seasonal-adjustment uint u100) ;; percentage adjustment
+
+;; Route demand and capacity tracking
+(define-map route-analytics
+  { origin-id: uint, destination-id: uint }
+  {
+    total-shipments: uint,
+    active-shipments: uint,
+    avg-delivery-time: uint,
+    capacity-utilization: uint, ;; percentage 0-100
+    demand-score: uint, ;; 0-100 relative demand
+    last-updated: uint
+  }
+)
+
+;; Cargo type pricing modifiers
+(define-map cargo-type-modifiers
+  { cargo-type: (string-ascii 50) }
+  {
+    base-modifier: uint, ;; percentage multiplier
+    temperature-controlled: bool,
+    hazardous: bool,
+    fragile: bool,
+    insurance-required: bool
+  }
+)
+
+;; Historical pricing data for market analysis
+(define-map pricing-history
+  { route-key: (string-ascii 100), time-period: uint }
+  {
+    avg-price: uint,
+    min-price: uint,
+    max-price: uint,
+    shipment-count: uint,
+    success-rate: uint
+  }
+)
+
+;; Dynamic pricing configuration per route
+(define-map route-pricing-config
+  { origin-id: uint, destination-id: uint }
+  {
+    distance-km: uint,
+    base-price: uint,
+    surge-threshold: uint, ;; active shipments that trigger surge pricing
+    max-surge-multiplier: uint,
+    off-peak-discount: uint,
+    created-by: principal,
+    active: bool
+  }
+)
+
+;; Initialize default cargo type modifiers
+(define-private (initialize-cargo-types)
+  (begin
+    (map-set cargo-type-modifiers
+      { cargo-type: "standard" }
+      { base-modifier: u100, temperature-controlled: false, hazardous: false, fragile: false, insurance-required: false })
+    (map-set cargo-type-modifiers
+      { cargo-type: "perishable" }
+      { base-modifier: u130, temperature-controlled: true, hazardous: false, fragile: true, insurance-required: true })
+    (map-set cargo-type-modifiers
+      { cargo-type: "hazardous" }
+      { base-modifier: u180, temperature-controlled: false, hazardous: true, fragile: false, insurance-required: true })
+    (map-set cargo-type-modifiers
+      { cargo-type: "fragile" }
+      { base-modifier: u115, temperature-controlled: false, hazardous: false, fragile: true, insurance-required: true })
+    (map-set cargo-type-modifiers
+      { cargo-type: "bulk" }
+      { base-modifier: u85, temperature-controlled: false, hazardous: false, fragile: false, insurance-required: false })
+  )
+)
+
+;; Set up route pricing configuration
+(define-public (configure-route-pricing 
+  (origin-id uint) 
+  (destination-id uint) 
+  (distance-km uint) 
+  (surge-threshold uint))
+  (let
+    (
+      (company-data (unwrap! (get-company-by-principal tx-sender) err-not-found))
+      (company-id (get company-id company-data))
+      (base-price (* distance-km (var-get base-rate-per-km)))
+    )
+    
+    ;; Verify company subscription
+    (asserts! (is-subscription-active company-id) err-not-subscriber)
+    (asserts! (> distance-km u0) err-invalid-pricing-params)
+    (asserts! (> surge-threshold u0) err-invalid-pricing-params)
+    
+    ;; Check if route already configured
+    (asserts! (is-none (map-get? route-pricing-config { origin-id: origin-id, destination-id: destination-id })) 
+              err-pricing-config-exists)
+    
+    (map-set route-pricing-config
+      { origin-id: origin-id, destination-id: destination-id }
+      {
+        distance-km: distance-km,
+        base-price: base-price,
+        surge-threshold: surge-threshold,
+        max-surge-multiplier: u250, ;; 250% max surge
+        off-peak-discount: u90, ;; 10% discount during off-peak
+        created-by: tx-sender,
+        active: true
+      }
+    )
+    
+    ;; Initialize route analytics
+    (map-set route-analytics
+      { origin-id: origin-id, destination-id: destination-id }
+      {
+        total-shipments: u0,
+        active-shipments: u0,
+        avg-delivery-time: u0,
+        capacity-utilization: u0,
+        demand-score: u50, ;; start with medium demand
+        last-updated: (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1)))
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Calculate dynamic price for a shipment
+(define-public (calculate-shipment-price 
+  (origin-id uint) 
+  (destination-id uint) 
+  (cargo-type (string-ascii 50)) 
+  (quantity uint))
+  (let
+    (
+      (route-config (unwrap! (map-get? route-pricing-config { origin-id: origin-id, destination-id: destination-id })
+                            err-route-not-found))
+      (route-stats (default-to 
+        { total-shipments: u0, active-shipments: u0, avg-delivery-time: u0, capacity-utilization: u0, demand-score: u50, last-updated: u0 }
+        (map-get? route-analytics { origin-id: origin-id, destination-id: destination-id })))
+      (cargo-modifier (default-to 
+        { base-modifier: u100, temperature-controlled: false, hazardous: false, fragile: false, insurance-required: false }
+        (map-get? cargo-type-modifiers { cargo-type: cargo-type })))
+      (base-price (get base-price route-config))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    
+    (asserts! (get active route-config) err-route-not-found)
+    (asserts! (> quantity u0) err-invalid-pricing-params)
+    
+    (let
+      (
+        ;; Calculate demand-based pricing
+        (demand-multiplier (calculate-demand-multiplier route-stats))
+        ;; Apply cargo type modifier
+        (cargo-adjusted-price (/ (* base-price (get base-modifier cargo-modifier)) u100))
+        ;; Apply quantity discount for bulk shipments
+        (quantity-discount (if (>= quantity u10) u95 u100)) ;; 5% discount for 10+ units
+        ;; Calculate final price with all modifiers
+        (demand-adjusted-price (/ (* cargo-adjusted-price demand-multiplier) u100))
+        (final-price (/ (* demand-adjusted-price quantity-discount quantity) u100))
+      )
+      
+      (ok {
+        base-price: base-price,
+        cargo-modifier: (get base-modifier cargo-modifier),
+        demand-multiplier: demand-multiplier,
+        quantity-discount: quantity-discount,
+        final-price: final-price,
+        estimated-delivery-time: (get avg-delivery-time route-stats)
+      })
+    )
+  )
+)
+
+;; Calculate demand multiplier based on route analytics
+(define-private (calculate-demand-multiplier (route-stats (tuple
+  (total-shipments uint)
+  (active-shipments uint)
+  (avg-delivery-time uint)
+  (capacity-utilization uint)
+  (demand-score uint)
+  (last-updated uint))))
+  (let
+    (
+      (active-shipments (get active-shipments route-stats))
+      (demand-score (get demand-score route-stats))
+      (capacity-util (get capacity-utilization route-stats))
+    )
+    
+    ;; Base multiplier starts at 100%
+    (let
+      (
+        ;; Higher demand increases price (50-150% based on demand score)
+        (demand-factor (+ u50 (/ demand-score u2)))
+        ;; High capacity utilization increases price
+        (capacity-factor (if (> capacity-util u80) u120 u100))
+        ;; Combine factors but cap at maximum multiplier
+        (raw-multiplier (/ (* demand-factor capacity-factor) u100))
+        (combined-multiplier (if (> raw-multiplier (var-get demand-multiplier-max))
+                               (var-get demand-multiplier-max)
+                               raw-multiplier))
+      )
+      combined-multiplier
+    )
+  )
+)
+
+;; Update route analytics when shipment is created/updated
+(define-public (update-route-analytics 
+  (origin-id uint) 
+  (destination-id uint) 
+  (shipment-status (string-ascii 20)))
+  (let
+    (
+      (current-stats (default-to 
+        { total-shipments: u0, active-shipments: u0, avg-delivery-time: u0, capacity-utilization: u0, demand-score: u50, last-updated: u0 }
+        (map-get? route-analytics { origin-id: origin-id, destination-id: destination-id })))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    
+    (let
+      (
+        (new-active (if (is-eq shipment-status "created")
+                      (+ (get active-shipments current-stats) u1)
+                      (if (or (is-eq shipment-status "delivered") (is-eq shipment-status "rejected"))
+                        (if (> (get active-shipments current-stats) u0)
+                          (- (get active-shipments current-stats) u1)
+                          u0)
+                        (get active-shipments current-stats))))
+        (new-total (if (is-eq shipment-status "created")
+                     (+ (get total-shipments current-stats) u1)
+                     (get total-shipments current-stats)))
+        ;; Update demand score based on activity
+        (new-demand-score (calculate-demand-score new-active new-total))
+      )
+      
+      (map-set route-analytics
+        { origin-id: origin-id, destination-id: destination-id }
+        (merge current-stats {
+          total-shipments: new-total,
+          active-shipments: new-active,
+          demand-score: new-demand-score,
+          last-updated: current-time
+        })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Calculate demand score based on shipment activity
+(define-private (calculate-demand-score (active-shipments uint) (total-shipments uint))
+  (if (is-eq total-shipments u0)
+    u50 ;; Default medium demand for new routes
+    (let
+      (
+        ;; Higher ratio of active to total indicates higher demand
+        (raw-ratio (if (> total-shipments u0) 
+                      (/ (* active-shipments u100) total-shipments)
+                      u0))
+        (activity-ratio (if (> raw-ratio u100) u100 raw-ratio))
+        ;; Adjust demand score based on activity
+        (demand-adjustment (/ activity-ratio u2))
+      )
+      (let
+        (
+          (raw-demand-score (+ u30 demand-adjustment))
+        )
+        (if (> raw-demand-score u100) u100 raw-demand-score) ;; Keep demand score between 30-100
+      )
+    )
+  )
+)
+
+;; Get pricing estimate for potential shipment
+(define-read-only (get-pricing-estimate 
+  (origin-id uint) 
+  (destination-id uint) 
+  (cargo-type (string-ascii 50)) 
+  (quantity uint))
+  (match (calculate-shipment-price origin-id destination-id cargo-type quantity)
+    success (ok success)
+    error (err error)
+  )
+)
+
+;; Get route analytics data
+(define-read-only (get-route-analytics (origin-id uint) (destination-id uint))
+  (map-get? route-analytics { origin-id: origin-id, destination-id: destination-id })
+)
+
+;; Get cargo type pricing modifier
+(define-read-only (get-cargo-type-modifier (cargo-type (string-ascii 50)))
+  (map-get? cargo-type-modifiers { cargo-type: cargo-type })
+)
+
+;; Get route pricing configuration
+(define-read-only (get-route-pricing-config (origin-id uint) (destination-id uint))
+  (map-get? route-pricing-config { origin-id: origin-id, destination-id: destination-id })
+)
+
+;; Admin function to update base pricing parameters
+(define-public (update-pricing-parameters 
+  (new-base-rate uint) 
+  (new-demand-multiplier-max uint) 
+  (new-distance-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (> new-base-rate u0) err-invalid-pricing-params)
+    (asserts! (>= new-demand-multiplier-max u100) err-invalid-pricing-params)
+    
+    (var-set base-rate-per-km new-base-rate)
+    (var-set demand-multiplier-max new-demand-multiplier-max)
+    (var-set distance-discount-threshold new-distance-threshold)
+    
+    (ok true)
+  )
+)
+
+;; Initialize the pricing engine with default cargo types
+(begin
+  (initialize-cargo-types)
+)
+
